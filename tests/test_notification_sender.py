@@ -5,6 +5,10 @@ Unit tests for src.notification_sender module.
 Tests sender classes in isolation (config, request shape, error handling).
 Does not duplicate test_notification.py which tests NotificationService.send() flow.
 """
+import base64
+import hashlib
+import hmac
+import json
 import os
 import sys
 import unittest
@@ -171,6 +175,60 @@ class TestFeishuSender(unittest.TestCase):
         result = sender.send_to_feishu("hello")
         self.assertFalse(result)
 
+    @mock.patch("src.notification_sender.feishu_sender.time.time", return_value=1700000000)
+    @mock.patch("src.notification_sender.feishu_sender.requests.post")
+    def test_send_with_secret_and_keyword_builds_signed_payload(self, mock_post, _mock_time):
+        mock_post.return_value = _response(200, {"code": 0})
+        cfg = _config(
+            feishu_webhook_url="https://feishu.example/hook",
+            feishu_webhook_secret="secret-token",
+            feishu_webhook_keyword="股票日报",
+        )
+        sender = FeishuSender(cfg)
+
+        result = sender.send_to_feishu("hello")
+
+        self.assertTrue(result)
+        mock_post.assert_called_once()
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(payload["timestamp"], "1700000000")
+        expected_sign = base64.b64encode(
+            hmac.new(
+                b"1700000000\nsecret-token",
+                digestmod=hashlib.sha256,
+            ).digest()
+        ).decode("utf-8")
+        self.assertEqual(payload["sign"], expected_sign)
+        self.assertEqual(
+            payload["card"]["elements"][0]["text"]["content"],
+            "股票日报\nhello",
+        )
+
+    @mock.patch("src.notification_sender.feishu_sender.requests.post")
+    def test_send_error_response_returns_false(self, mock_post):
+        mock_post.return_value = _response(200, {"code": 19024, "msg": "keyword not found"})
+        cfg = _config(feishu_webhook_url="https://feishu.example/hook")
+        sender = FeishuSender(cfg)
+
+        result = sender.send_to_feishu("hello")
+
+        self.assertFalse(result)
+        self.assertEqual(mock_post.call_count, 2)
+
+    @mock.patch("src.notification_sender.feishu_sender.requests.post")
+    def test_send_with_keyword_that_leaves_too_little_chunk_budget_returns_false(self, mock_post):
+        cfg = _config(
+            feishu_webhook_url="https://feishu.example/hook",
+            feishu_webhook_keyword="abcd",
+            feishu_max_bytes=60,
+        )
+        sender = FeishuSender(cfg)
+
+        result = sender.send_to_feishu("x" * 100)
+
+        self.assertFalse(result)
+        mock_post.assert_not_called()
+
 
 class TestEmailSender(unittest.TestCase):
     """Unit tests for EmailSender (config and receiver logic; send path covered via service)."""
@@ -318,6 +376,80 @@ class TestCustomWebhookSender(unittest.TestCase):
         cfg = _config(custom_webhook_urls=["https://example.com/webhook"])
         sender = CustomWebhookSender(cfg)
         result = sender.send_to_custom("hello")
+        self.assertTrue(result)
+        body = mock_post.call_args[1]["data"].decode("utf-8")
+        self.assertIn("hello", body)
+
+    @mock.patch("src.notification_sender.custom_webhook_sender.requests.post")
+    def test_send_uses_custom_body_template(self, mock_post):
+        mock_post.return_value = _response(200)
+        cfg = _config(
+            custom_webhook_urls=["https://example.com/webhook"],
+            custom_webhook_body_template='{"msg_type":"text","content":$content_json}',
+        )
+        sender = CustomWebhookSender(cfg)
+
+        result = sender.send_to_custom('hello "world"')
+
+        self.assertTrue(result)
+        body = mock_post.call_args[1]["data"].decode("utf-8")
+        self.assertEqual(
+            json.loads(body),
+            {"msg_type": "text", "content": 'hello "world"'},
+        )
+
+    @mock.patch("src.notification_sender.custom_webhook_sender.requests.post")
+    def test_dingtalk_send_uses_custom_body_template(self, mock_post):
+        mock_post.return_value = _response(200)
+        cfg = _config(
+            custom_webhook_urls=["https://oapi.dingtalk.com/robot/send?access_token=token"],
+            custom_webhook_body_template='{"msgtype":"text","text":{"content":$content_json}}',
+        )
+        sender = CustomWebhookSender(cfg)
+
+        result = sender.send_to_custom("hello dingtalk")
+
+        self.assertTrue(result)
+        mock_post.assert_called_once()
+        body = mock_post.call_args[1]["data"].decode("utf-8")
+        self.assertEqual(
+            json.loads(body),
+            {"msgtype": "text", "text": {"content": "hello dingtalk"}},
+        )
+
+    @mock.patch("time.sleep", return_value=None)
+    @mock.patch("src.notification_sender.custom_webhook_sender.requests.post")
+    def test_dingtalk_template_failure_falls_back_to_chunked_send(
+        self, mock_post, _mock_sleep
+    ):
+        mock_post.side_effect = [_response(400), _response(200), _response(200), _response(200)]
+        cfg = _config(
+            custom_webhook_urls=["https://oapi.dingtalk.com/robot/send?access_token=token"],
+            custom_webhook_body_template='{"msgtype":"text","text":{"content":$content_json}}',
+        )
+        sender = CustomWebhookSender(cfg)
+
+        result = sender.send_to_custom("A" * 40000)
+
+        self.assertTrue(result)
+        self.assertGreater(mock_post.call_count, 1)
+        first_body = json.loads(mock_post.call_args_list[0].kwargs["data"].decode("utf-8"))
+        fallback_body = json.loads(mock_post.call_args_list[1].kwargs["data"].decode("utf-8"))
+        self.assertEqual(first_body["msgtype"], "text")
+        self.assertEqual(fallback_body["msgtype"], "markdown")
+        self.assertIn("markdown", fallback_body)
+
+    @mock.patch("src.notification_sender.custom_webhook_sender.requests.post")
+    def test_invalid_custom_body_template_falls_back(self, mock_post):
+        mock_post.return_value = _response(200)
+        cfg = _config(
+            custom_webhook_urls=["https://example.com/webhook"],
+            custom_webhook_body_template='{"content": $content',
+        )
+        sender = CustomWebhookSender(cfg)
+
+        result = sender.send_to_custom("hello")
+
         self.assertTrue(result)
         body = mock_post.call_args[1]["data"].decode("utf-8")
         self.assertIn("hello", body)
